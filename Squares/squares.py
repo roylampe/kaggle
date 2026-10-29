@@ -276,18 +276,104 @@ def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None):
     return float(side), [(float(x[i]), float(y[i]), float(ang[i])) for i in range(n)]
 
 
+def pack_many(ns, time_limit=60.0, seed=0, verbose=False, angles=None):
+    """Run pack_squares for every n in `ns`. Returns {n: (side, squares)}."""
+    return {n: pack_squares(n, time_limit=time_limit, seed=seed,
+                            verbose=verbose, angles=angles) for n in ns}
+
+
+def save_csv(results, filename="packings.csv", append=False):
+    """
+    Write packings to a CSV with columns:  id, n, square_id, x, y, angle
+
+      id         row identifier (0 .. number of rows - 1)
+      n          which puzzle the square belongs to
+      square_id  index of the square within its puzzle (0 .. n-1)
+      x, y       centre of the square (container is [0, side] x [0, side])
+      angle      rotation in RADIANS
+
+    `results` is either {n: (side, squares)} as returned by pack_many(), or a
+    single (side, squares) tuple as returned by pack_squares().
+    With append=True, rows are added to an existing file and `id` continues from
+    its last row (the header is only written for a new/empty file).
+    Returns the number of rows written.
+    """
+    import csv
+    import os
+
+    if isinstance(results, tuple):  # single (side, squares)
+        results = {len(results[1]): results}
+
+    next_id, write_header = 0, False
+    if append and os.path.exists(filename) and os.path.getsize(filename) > 0:
+        write_header = False
+        with open(filename, newline="") as f:
+            rows = list(csv.reader(f))
+        if len(rows) > 1:
+            next_id = int(rows[-1][0]) + 1
+
+    count = 0
+    with open(filename, "a" if append else "w", newline="") as f:
+        w = csv.writer(f, lineterminator="\n")
+        if write_header:
+            w.writerow(["id", "n", "square_id", "x", "y", "angle"])
+        for n in sorted(results):
+            _, squares = results[n]
+            for sid, (x, y, a_deg) in enumerate(squares):
+                w.writerow([next_id, n, sid, f"{x:.15g}", f"{y:.15g}",
+                            f"{math.radians(a_deg):.15g}"])
+                next_id += 1
+                count += 1
+    return count
+
+
+def _parse_ns(spec):
+    """'5' -> [5];  '1-10' -> [1..10];  '1,3,7-9' -> [1,3,7,8,9]"""
+    out = []
+    for part in spec.split(","):
+        if "-" in part:
+            a, b = part.split("-")
+            out += list(range(int(a), int(b) + 1))
+        else:
+            out.append(int(part))
+    return out
+
+
 if __name__ == "__main__":
-    import sys
-    n = int(sys.argv[1]) if len(sys.argv) > 1 else 5
-    tl = float(sys.argv[2]) if len(sys.argv) > 2 else 60
-    # optional 3rd argument: comma-separated allowed angles, e.g. "0,45"
-    angs = [float(a) for a in sys.argv[3].split(",")] if len(sys.argv) > 3 else None
-    side, squares = pack_squares(n, time_limit=tl, verbose=True, angles=angs)
-    print(f"\nn = {n}: container side ~= {side:.5f}")
-    print(f"max violation: {max_violation(side, squares):.2e}")
-    try:
-        print("image saved to", plot_packing(side, squares, f"packing_n{n}.png"))
-    except ImportError:
-        print("(install matplotlib to save an image)")
-    for i, (x, y, a) in enumerate(squares, 1):
-        print(f"  square {i:2d}: center = ({x:8.4f}, {y:8.4f})  angle = {a:7.3f} deg")
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Pack n unit squares in the smallest square.")
+    ap.add_argument("n", nargs="?", default="5",
+                    help='number of squares: "5", a range "1-10", or a list "1,3,7-9"')
+    ap.add_argument("time", nargs="?", type=float, default=60,
+                    help="seconds of search PER n (default 60)")
+    ap.add_argument("angles", nargs="?", default=None,
+                    help='optional allowed angles in degrees, e.g. "0,45"')
+    ap.add_argument("--csv", metavar="FILE", help="write results to a CSV file "
+                    "(columns: id,n,square_id,x,y,angle[radians])")
+    ap.add_argument("--append", action="store_true", help="append to the CSV instead of overwriting")
+    ap.add_argument("--no-plot", action="store_true", help="don't save a PNG (single n only)")
+    args = ap.parse_args()
+
+    ns = _parse_ns(args.n)
+    angs = [float(a) for a in args.angles.split(",")] if args.angles else None
+    results = {}
+    for n in ns:
+        side, squares = pack_squares(n, time_limit=args.time, verbose=len(ns) == 1, angles=angs)
+        results[n] = (side, squares)
+        print(f"n = {n}: container side ~= {side:.5f}   "
+              f"max violation {max_violation(side, squares):.1e}", flush=True)
+        if args.csv:  # save progress after each n so long runs are never lost
+            save_csv({n: results[n]}, args.csv, append=args.append or len(results) > 1)
+
+    if len(ns) == 1:
+        side, squares = results[ns[0]]
+        if not args.no_plot:
+            try:
+                print("image saved to", plot_packing(side, squares, f"packing_n{ns[0]}.png"))
+            except ImportError:
+                print("(install matplotlib to save an image)")
+        for i, (x, y, a) in enumerate(squares, 1):
+            print(f"  square {i:2d}: center = ({x:8.4f}, {y:8.4f})  angle = {a:7.3f} deg")
+    if args.csv:
+        print("CSV written to", args.csv)
