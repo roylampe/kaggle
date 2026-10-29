@@ -304,7 +304,7 @@ def save_csv(results, filename="packings.csv", append=False):
     if isinstance(results, tuple):  # single (side, squares)
         results = {len(results[1]): results}
 
-    next_id, write_header = 0, False
+    next_id, write_header = 0, True
     if append and os.path.exists(filename) and os.path.getsize(filename) > 0:
         write_header = False
         with open(filename, newline="") as f:
