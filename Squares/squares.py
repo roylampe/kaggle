@@ -229,7 +229,8 @@ def plot_packing(side, squares, filename="packing.png"):
     return filename
 
 
-def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None, snap=True):
+def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None, snap=True,
+                 return_stats=False):
     """
     Find a small square container holding n unit squares.
 
@@ -244,6 +245,12 @@ def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None, snap=Tr
                  goes).  If None, angles are free to take any value.
     snap       : if True (default) and angles are free, angles within 3 degrees
                  of 0/45 are snapped to exactly 0/45 when the packing stays valid
+    return_stats : if True, return (side, squares, stats) where stats is a dict:
+                 attempts      total candidate packings attempted (random starts + hops)
+                 random_starts fresh random layouts tried
+                 hops          basin-hopping moves tried (relocating 1-3 squares)
+                 improvements  attempts that found a smaller container
+                 seconds       time spent searching
 
     Returns
     -------
@@ -253,7 +260,9 @@ def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None, snap=Tr
     if n < 1:
         raise ValueError("n must be >= 1")
     if n == 1:
-        return 1.0, [(0.5, 0.5, 0.0)]
+        res = (1.0, [(0.5, 0.5, 0.0)])
+        stats = {"attempts": 0, "random_starts": 0, "hops": 0, "improvements": 0, "seconds": 0.0}
+        return res + (stats,) if return_stats else res
 
     fix = angles is not None
     if fix:
@@ -269,6 +278,7 @@ def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None, snap=Tr
     iu, ju = np.triu_indices(n, k=1)
     best_S, best_p = math.inf, None
     stall = 0
+    n_starts = n_hops = n_improved = 0
 
     def log(msg):
         if verbose:
@@ -278,16 +288,19 @@ def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None, snap=Tr
     while time.time() - t0 < time_limit:
         if cur_p is None or stall >= 15:        # (re)start
             cur_S, cur_p = _random_start(n, rng, iu, ju, angles_rad)
+            n_starts += 1
             stall = 0
             log(f"new random start -> {cur_S:.5f}")
         else:                                    # basin hop
             S2, p2 = _hop(cur_p, cur_S, n, rng, iu, ju, angles_rad)
+            n_hops += 1
             if S2 < cur_S - 1e-6:
                 cur_S, cur_p, stall = S2, p2, 0
             else:
                 stall += 1
         if cur_p is not None and cur_S < best_S - 1e-9:
             best_S, best_p = cur_S, cur_p.copy()
+            n_improved += 1
             log(f"best side = {best_S:.5f}")
 
     # final fine polish
@@ -303,13 +316,26 @@ def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None, snap=Tr
     side *= f
     x, y, t = p[:n], p[n:2 * n], p[2 * n:]
     ang = np.round(np.degrees(t), 9) % 90.0
-    return float(side), [(float(x[i]), float(y[i]), float(ang[i])) for i in range(n)]
+    res = (float(side), [(float(x[i]), float(y[i]), float(ang[i])) for i in range(n)])
+    if not return_stats:
+        return res
+    stats = {"attempts": n_starts + n_hops, "random_starts": n_starts, "hops": n_hops,
+             "improvements": n_improved, "seconds": time.time() - t0}
+    return res + (stats,)
 
 
-def pack_many(ns, time_limit=60.0, seed=0, verbose=False, angles=None):
-    """Run pack_squares for every n in `ns`. Returns {n: (side, squares)}."""
-    return {n: pack_squares(n, time_limit=time_limit, seed=seed,
-                            verbose=verbose, angles=angles) for n in ns}
+def pack_many(ns, time_limit=60.0, seed=0, verbose=False, angles=None, return_stats=False):
+    """
+    Run pack_squares for every n in `ns`.
+    Returns {n: (side, squares)}, or ({n: (side, squares)}, {n: stats}) if
+    return_stats=True (stats as described in pack_squares).
+    """
+    results, all_stats = {}, {}
+    for n in ns:
+        side, squares, stats = pack_squares(n, time_limit=time_limit, seed=seed,
+                                            verbose=verbose, angles=angles, return_stats=True)
+        results[n], all_stats[n] = (side, squares), stats
+    return (results, all_stats) if return_stats else results
 
 
 def save_csv(results, filename="packings.csv", append=False, clockwise=False, start_id=None):
@@ -404,12 +430,16 @@ if __name__ == "__main__":
 
     ns = _parse_ns(args.n)
     angs = [float(a) for a in args.angles.split(",")] if args.angles else None
-    results = {}
+    results, total_attempts = {}, 0
     for n in ns:
-        side, squares = pack_squares(n, time_limit=args.time, verbose=len(ns) == 1, angles=angs)
+        side, squares, st = pack_squares(n, time_limit=args.time, verbose=len(ns) == 1,
+                                         angles=angs, return_stats=True)
         results[n] = (side, squares)
+        total_attempts += st["attempts"]
         print(f"n = {n}: container side ~= {side:.5f}   "
-              f"max violation {max_violation(side, squares):.1e}", flush=True)
+              f"max violation {max_violation(side, squares):.1e}   "
+              f"combinations attempted: {st['attempts']:,} "
+              f"({st['random_starts']:,} random starts + {st['hops']:,} hops)", flush=True)
         if args.csv:  # save progress after each n so long runs are never lost
             first = len(results) == 1   # --start-id applies to the first row only
             save_csv({n: results[n]}, args.csv, append=args.append or not first,
@@ -424,5 +454,6 @@ if __name__ == "__main__":
                 print("(install matplotlib to save an image)")
         for i, (x, y, a) in enumerate(squares, 1):
             print(f"  square {i:2d}: center = ({x:8.4f}, {y:8.4f})  angle = {a:7.3f} deg")
+    print(f"\nTotal combinations attempted: {total_attempts:,}")
     if args.csv:
         print("CSV written to", args.csv)
