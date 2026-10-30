@@ -173,6 +173,27 @@ def _hop(p, S, n, rng, iu, ju, angles=None):
 # ----------------------------------------------------------------------------
 # Public API
 # ----------------------------------------------------------------------------
+def _snap_angles(p, n, S, iu, ju, tol_deg=3.0):
+    """
+    Snap angles lying within `tol_deg` of a multiple of 45 degrees to that exact
+    value (0 or 45), keeping each change only if positions can be re-relaxed to a
+    valid packing.  Removes noise such as 2e-07 rad and drift such as 44.4 deg.
+    """
+    p = p.copy()
+    for i in range(n):
+        deg = math.degrees(p[2 * n + i]) % 90.0
+        target = round(deg / 45.0) * 45.0
+        if abs(deg - target) > tol_deg:
+            continue
+        q = p.copy()
+        q[2 * n + i] = math.radians(target)
+        q, e = _relax(q, n, S, iu, ju, fix=True)   # positions only, angles frozen
+        if e < TOL:
+            p = q
+            p[2 * n + i] = math.radians(target)    # exact value, not re-relaxed
+    return p
+
+
 def max_violation(side, squares):
     """Largest overlap / out-of-bounds depth (~0 for a valid packing)."""
     n = len(squares)
@@ -208,7 +229,7 @@ def plot_packing(side, squares, filename="packing.png"):
     return filename
 
 
-def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None):
+def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None, snap=True):
     """
     Find a small square container holding n unit squares.
 
@@ -221,6 +242,8 @@ def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None):
                  If given, every square is restricted to one of these angles
                  (the solver chooses which square gets which angle and where it
                  goes).  If None, angles are free to take any value.
+    snap       : if True (default) and angles are free, angles within 3 degrees
+                 of 0/45 are snapped to exactly 0/45 when the packing stays valid
 
     Returns
     -------
@@ -271,6 +294,13 @@ def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None):
     S, p = _shrink(best_p, best_S, n, iu, ju, step=1e-2, min_step=1e-7, fix=fix)
     side = S + 1e-5  # tiny margin to absorb residual numerical overlap
     p, _ = _relax(p, n, side, iu, ju, fix=fix)
+    if snap and not fix:
+        p = _snap_angles(p, n, side, iu, ju)
+    # Scale centres up by 1 part in a million so that squares which merely touch
+    # end up strictly non-overlapping (removes ~1e-9 numerical overlaps).
+    f = 1.0 + 1e-6
+    p[:2 * n] *= f
+    side *= f
     x, y, t = p[:n], p[n:2 * n], p[2 * n:]
     ang = np.round(np.degrees(t), 9) % 90.0
     return float(side), [(float(x[i]), float(y[i]), float(ang[i])) for i in range(n)]
@@ -282,7 +312,7 @@ def pack_many(ns, time_limit=60.0, seed=0, verbose=False, angles=None):
                             verbose=verbose, angles=angles) for n in ns}
 
 
-def save_csv(results, filename="packings.csv", append=False):
+def save_csv(results, filename="packings.csv", append=False, clockwise=False, start_id=None):
     """
     Write packings to a CSV with columns:  id, n, square_id, x, y, angle
 
@@ -294,6 +324,11 @@ def save_csv(results, filename="packings.csv", append=False):
 
     `results` is either {n: (side, squares)} as returned by pack_many(), or a
     single (side, squares) tuple as returned by pack_squares().
+    Angles are counter-clockwise (standard maths convention, y axis pointing up)
+    and lie in [0, pi/2) because a unit square looks the same after a quarter turn.
+    Pass clockwise=True if your checker measures rotation clockwise.
+    start_id sets the `id` of the first row written.  If None (default), ids start
+    at 0, or continue from the last row of the file when append=True.
     With append=True, rows are added to an existing file and `id` continues from
     its last row (the header is only written for a new/empty file).
     Returns the number of rows written.
@@ -305,12 +340,15 @@ def save_csv(results, filename="packings.csv", append=False):
         results = {len(results[1]): results}
 
     next_id, write_header = 0, True
+    explicit_start = start_id is not None
     if append and os.path.exists(filename) and os.path.getsize(filename) > 0:
         write_header = False
         with open(filename, newline="") as f:
             rows = list(csv.reader(f))
         if len(rows) > 1:
             next_id = int(rows[-1][0]) + 1
+    if explicit_start:
+        next_id = int(start_id)
 
     count = 0
     with open(filename, "a" if append else "w", newline="") as f:
@@ -320,6 +358,10 @@ def save_csv(results, filename="packings.csv", append=False):
         for n in sorted(results):
             _, squares = results[n]
             for sid, (x, y, a_deg) in enumerate(squares):
+                if clockwise:
+                    a_deg = (-a_deg) % 90.0
+                if a_deg < 1e-9 or a_deg > 90.0 - 1e-9:
+                    a_deg = 0.0            # avoid 1e-10 / 89.9999999 noise
                 w.writerow([next_id, n, sid, f"{x:.15g}", f"{y:.15g}",
                             f"{math.radians(a_deg):.15g}"])
                 next_id += 1
@@ -352,6 +394,11 @@ if __name__ == "__main__":
     ap.add_argument("--csv", metavar="FILE", help="write results to a CSV file "
                     "(columns: id,n,square_id,x,y,angle[radians])")
     ap.add_argument("--append", action="store_true", help="append to the CSV instead of overwriting")
+    ap.add_argument("--start-id", type=int, default=None, metavar="ID",
+                    help="row id of the first CSV row (default: 0, or continue after the "
+                    "last row when appending)")
+    ap.add_argument("--clockwise", action="store_true",
+                    help="write angles as clockwise rotations (default: counter-clockwise)")
     ap.add_argument("--no-plot", action="store_true", help="don't save a PNG (single n only)")
     args = ap.parse_args()
 
@@ -364,7 +411,9 @@ if __name__ == "__main__":
         print(f"n = {n}: container side ~= {side:.5f}   "
               f"max violation {max_violation(side, squares):.1e}", flush=True)
         if args.csv:  # save progress after each n so long runs are never lost
-            save_csv({n: results[n]}, args.csv, append=args.append or len(results) > 1)
+            first = len(results) == 1   # --start-id applies to the first row only
+            save_csv({n: results[n]}, args.csv, append=args.append or not first,
+                     clockwise=args.clockwise, start_id=args.start_id if first else None)
 
     if len(ns) == 1:
         side, squares = results[ns[0]]
