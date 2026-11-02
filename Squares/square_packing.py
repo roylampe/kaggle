@@ -59,6 +59,14 @@ PYTHON
     # 8. Keep angles exactly as found instead of snapping to 0/45 degrees
     pack_squares(5, time_limit=20, snap=False)
 
+    # 8b. Best-known side length given: search a fixed container of that size, stop when reached
+    side, squares, stats = pack_squares(11, time_limit=200, target=3.877084, return_stats=True)
+    print(stats["reached_target"])             # True / False
+    #     several seeds in parallel (uses all CPU cores, stops when one seed reaches the target)
+    side, squares, stats = pack_best_of(11, seeds=8, time_limit=200, target=3.877084)
+    #     targets for many n at once, from a CSV with columns n, best_known
+    results = pack_many(range(1, 31), time_limit=60, targets=read_targets("best_known.csv"))
+
     # 9. Verify a result (largest overlap/out-of-bounds depth, ~0 if valid)
     print(max_violation(side, squares))
 
@@ -86,6 +94,9 @@ COMMAND LINE      python square_packing.py N [SECONDS] [ANGLES] [options]
     python square_packing.py 11 60 --seed 3          # different random seed
     python square_packing.py 11 60 --stall-limit 5 --max-hop 2 --hop-margin 0.6
     python square_packing.py 5 30 --no-snap --no-plot
+    python square_packing.py 11 200 --target 3.877084          # best-known side given
+    python square_packing.py 11 200 --target 3.877084 --seeds 8 --workers 4
+    python square_packing.py 1-30 60 --targets best_known.csv --csv out.csv
     python square_packing.py --help                  # all options
 ==============================================================================
 """
@@ -122,41 +133,37 @@ def _energy_grad(params, n, S, iu, ju):
     gt += 2 * (a1 + a2 + b1 + b2) * dh
     dS = -2 * np.sum(a2) - 2 * np.sum(b2)
 
-    # --- pairwise overlaps (SAT, least-penetration axis) ---
+    # --- pairwise overlaps (SAT, least-penetration axis), vectorised over the 4 axes ---
     if len(iu):
         ti, tj = t[iu], t[ju]
         dx, dy = x[ju] - x[iu], y[ju] - y[iu]
-        phis = (ti, ti + np.pi / 2, tj, tj + np.pi / 2)
-        ovs, info = [], []
-        for phi in phis:
-            di, dj = phi - ti, phi - tj
-            ri = 0.5 * (np.abs(np.cos(di)) + np.abs(np.sin(di)))
-            rj = 0.5 * (np.abs(np.cos(dj)) + np.abs(np.sin(dj)))
-            proj = np.cos(phi) * dx + np.sin(phi) * dy
-            ovs.append(ri + rj - np.abs(proj))
-            info.append((di, dj, proj, phi))
-        ovs = np.array(ovs)
-        k = np.argmin(ovs, axis=0)
+        phis = np.stack((ti, ti + np.pi / 2, tj, tj + np.pi / 2))        # (4, pairs)
+        di, dj = phis - ti, phis - tj
+        ri = 0.5 * (np.abs(np.cos(di)) + np.abs(np.sin(di)))
+        rj = 0.5 * (np.abs(np.cos(dj)) + np.abs(np.sin(dj)))
+        proj = np.cos(phis) * dx + np.sin(phis) * dy
+        ovs = ri + rj - np.abs(proj)
+        k = ovs.argmin(axis=0)
         pen = ovs[k, np.arange(len(iu))]
-        act = pen > 0
-        e += np.sum(pen[act] ** 2)
-        if act.any():
-            di = np.choose(k, [i[0] for i in info])
-            dj = np.choose(k, [i[1] for i in info])
-            proj = np.choose(k, [i[2] for i in info])
-            phi = np.choose(k, [i[3] for i in info])
-            sg = np.sign(proj)
-            dq_dphi = sg * (-np.sin(phi) * dx + np.cos(phi) * dy)
-            gdi, gdj = _g(di), _g(dj)
-            first = k < 2  # axis tied to square i
+        act = np.flatnonzero(pen > 0)
+        if act.size:
+            ka = k[act]
+            pa = pen[act]
+            e += np.sum(pa ** 2)
+            dia, dja = di[ka, act], dj[ka, act]
+            pj, phi = proj[ka, act], phis[ka, act]
+            sg = np.sign(pj)
+            dq_dphi = sg * (-np.sin(phi) * dx[act] + np.cos(phi) * dy[act])
+            gdi, gdj = _g(dia), _g(dja)
+            first = ka < 2                                   # axis tied to square i
             d_ti = np.where(first, gdj - dq_dphi, -gdi)
             d_tj = np.where(first, -gdj, gdi - dq_dphi)
-            d_xj = -sg * np.cos(phi)
-            d_yj = -sg * np.sin(phi)
-            w = 2 * pen * act
-            np.add.at(gx, ju, w * d_xj); np.add.at(gx, iu, -w * d_xj)
-            np.add.at(gy, ju, w * d_yj); np.add.at(gy, iu, -w * d_yj)
-            np.add.at(gt, iu, w * d_ti); np.add.at(gt, ju, w * d_tj)
+            w = 2 * pa
+            wx, wy = w * (-sg * np.cos(phi)), w * (-sg * np.sin(phi))
+            ia, ja = iu[act], ju[act]
+            gx += np.bincount(ja, wx, n) - np.bincount(ia, wx, n)
+            gy += np.bincount(ja, wy, n) - np.bincount(ia, wy, n)
+            gt += np.bincount(ia, w * d_ti, n) + np.bincount(ja, w * d_tj, n)
     return e, np.concatenate([gx, gy, gt]), dS
 
 
@@ -291,6 +298,56 @@ def _construction(n, bases=None):
     return side[n], np.concatenate([cfg[:, 0], cfg[:, 1], cfg[:, 2]])
 
 
+def _feasible_search(n, S, rng, iu, ju, deadline, angles=None, max_hop=3, stall_limit=40,
+                     hop_maxiter=400, counter=None):
+    """
+    Look for a packing of n unit squares in a container of FIXED side S (energy = 0).
+    Energy-based hopping: relocate the squares that overlap most (chosen with probability
+    proportional to their overlap gradient), re-relax, keep the move if the energy drops;
+    restart from a random layout when stuck.  Returns the packing vector, or None on timeout.
+    """
+    fix = angles is not None
+
+    def new_angles(k):
+        return rng.choice(angles, k) if fix else rng.uniform(0, math.pi / 2, k)
+
+    def start():
+        p = np.concatenate([rng.uniform(0.5, S - 0.5, 2 * n), new_angles(n)])
+        if counter is not None:
+            counter[0] += 1
+        return _relax(p, n, S, iu, ju, fix=fix)
+
+    p, e = start()
+    stall = 0
+    while time.time() < deadline:
+        if e < TOL:
+            return p
+        if stall >= stall_limit:
+            p, e = start()
+            stall = 0
+            continue
+        _, g, _ = _energy_grad(p, n, S, iu, ju)
+        w = np.hypot(g[:n], g[n:2 * n]) + 1e-12
+        w = w / w.sum()
+        if rng.random() < 0.3:                      # sometimes pick squares uniformly
+            w = np.full(n, 1.0 / n)
+        k = int(rng.integers(1, min(n, max_hop) + 1))
+        idx = rng.choice(n, k, replace=False, p=w)
+        q = p.copy()
+        q[idx] = rng.uniform(0.5, S - 0.5, k)
+        q[n + idx] = rng.uniform(0.5, S - 0.5, k)
+        q[2 * n + idx] = new_angles(k)
+        q[:2 * n] += rng.normal(0, 0.01, 2 * n)
+        if counter is not None:
+            counter[0] += 1
+        q, eq = _relax(q, n, S, iu, ju, maxiter=hop_maxiter, fix=fix)
+        if eq < e - 1e-12:
+            p, e, stall = q, eq, 0
+        else:
+            stall += 1
+    return p if e < TOL else None
+
+
 def _hop(p, S, n, rng, iu, ju, angles=None, max_hop=3, hop_margin=0.35):
     """Relocate 1-3 random squares, re-relax in a slightly larger box, shrink."""
     q = p.copy()
@@ -370,7 +427,8 @@ def plot_packing(side, squares, filename="packing.png"):
 
 def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None, snap=True,
                  return_stats=False, stall_limit=15, max_hop=3, hop_margin=0.35,
-                 construct=True, bases=None):
+                 construct=True, bases=None, target=None, target_slack=None, target_tol=1e-4,
+                 target_fraction=0.8):
     """
     Find a small square container holding n unit squares.
 
@@ -391,6 +449,17 @@ def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None, snap=Tr
                  a random layout.  Set False for purely random starts.
     bases      : optional {m: (side, squares)} of earlier results (e.g. from pack_many)
                  that the construction may extend with L-layers.
+    target     : optional best-known side length for this n.  The search then (1) looks for
+                 a packing in a container of exactly target + target_slack (a pure
+                 feasibility search, see _feasible_search) using up to target_fraction of the
+                 time, tightens it, and (2) stops as soon as side <= target + target_tol.
+                 A wrong (too small) target is harmless: the search falls back to normal.
+    target_slack : room added to the target for the feasibility search (default 0.13% of the
+                 target, e.g. 0.005 for n=11).  The optimum itself fits exactly, but a container
+                 that tight is a needle in a haystack (2e-4 failed in every test); with ~0.13%
+                 the search finds the best-known layout and the shrink step then tightens it
+    target_tol : stop early when side <= target + target_tol (default 1e-4)
+    target_fraction : share of time_limit spent on the feasibility search (default 0.8)
     stall_limit : failed hops in a row before abandoning the current layout and
                  starting a fresh random one (default 15)
     max_hop    : a hop relocates 1..max_hop random squares (default 3)
@@ -399,8 +468,10 @@ def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None, snap=Tr
                  attempts      total candidate packings attempted (random starts + hops)
                  random_starts fresh random layouts tried
                  seeded_starts starts from the constructed layout (see `construct`)
+                 fixed_container_attempts  relaxations in the fixed-container search (target)
                  hops          basin-hopping moves tried (relocating 1-3 squares)
                  improvements  attempts that found a smaller container
+                 reached_target True if side <= target + target_tol (None if no target given)
                  seconds       time spent searching
 
     Returns
@@ -412,7 +483,8 @@ def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None, snap=Tr
         raise ValueError("n must be >= 1")
     if n == 1:
         res = (1.0, [(0.5, 0.5, 0.0)])
-        stats = {"attempts": 0, "random_starts": 0, "seeded_starts": 0, "hops": 0, "improvements": 0, "seconds": 0.0}
+        stats = {"attempts": 0, "random_starts": 0, "seeded_starts": 0, "fixed_container_attempts": 0, "hops": 0,
+                 "improvements": 0, "seconds": 0.0, "reached_target": None if target is None else True}
         return res + (stats,) if return_stats else res
 
     fix = angles is not None
@@ -429,7 +501,7 @@ def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None, snap=Tr
     iu, ju = np.triu_indices(n, k=1)
     best_S, best_p = math.inf, None
     stall = 0
-    n_starts = n_hops = n_improved = n_seeded = 0
+    n_starts = n_hops = n_improved = n_seeded = n_feas = 0
     use_construct = construct and not fix
 
     def log(msg):
@@ -437,7 +509,24 @@ def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None, snap=Tr
             print(f"[{time.time() - t0:6.1f}s] {msg}", flush=True)
 
     cur_S, cur_p = math.inf, None
+    if target is not None:                       # fixed-container feasibility search
+        if target_slack is None:
+            target_slack = 0.0013 * float(target)
+        S_t = float(target) + target_slack
+        feas_count = [0]
+        p_f = _feasible_search(n, S_t, rng, iu, ju, t0 + time_limit * target_fraction,
+                               angles_rad, max_hop, counter=feas_count)
+        n_feas = feas_count[0]
+        if p_f is not None:
+            cur_S, cur_p = _shrink(p_f, S_t, n, iu, ju, step=target_slack, fix=fix)
+            best_S, best_p = cur_S, cur_p.copy()
+            n_improved += 1
+            log(f"feasibility search found side {best_S:.6f} (target {target:.6f})")
+        else:
+            log(f"no packing found in a container of side {S_t:.6f}; falling back to normal search")
     while time.time() - t0 < time_limit:
+        if target is not None and best_S <= target + target_tol:
+            break
         if cur_p is None or stall >= stall_limit:        # (re)start
             if use_construct and (cur_p is None or rng.random() < 0.5):
                 S0, p0 = _construction(n, bases)
@@ -485,37 +574,107 @@ def pack_squares(n, time_limit=60.0, seed=0, verbose=False, angles=None, snap=Tr
     res = (float(side), [(float(x[i]), float(y[i]), float(ang[i])) for i in range(n)])
     if not return_stats:
         return res
-    stats = {"attempts": n_starts + n_seeded + n_hops, "random_starts": n_starts,
+    stats = {"attempts": n_starts + n_seeded + n_hops + n_feas, "random_starts": n_starts,
+             "fixed_container_attempts": n_feas,
              "seeded_starts": n_seeded, "hops": n_hops,
-             "improvements": n_improved, "seconds": time.time() - t0}
+             "improvements": n_improved, "seconds": time.time() - t0,
+             "reached_target": None if target is None else bool(best_S <= target + target_tol)}
     return res + (stats,)
 
 
-def pack_many(ns, time_limit=60.0, seed=0, verbose=False, angles=None, return_stats=False):
+def pack_many(ns, time_limit=60.0, seed=0, verbose=False, angles=None, return_stats=False,
+              targets=None, **kwargs):
     """
     Run pack_squares for every n in `ns`.
     Returns {n: (side, squares)}, or ({n: (side, squares)}, {n: stats}) if
     return_stats=True (stats as described in pack_squares).
+    targets: optional {n: best_known_side}; each n is searched with its own target.
+    Extra keyword arguments are passed on to pack_squares.
     """
     results, all_stats = {}, {}
     for n in ns:
         side, squares, stats = pack_squares(n, time_limit=time_limit, seed=seed,
                                             verbose=verbose, angles=angles, return_stats=True,
-                                            bases=dict(results))
+                                            bases=dict(results),
+                                            target=(targets or {}).get(n), **kwargs)
         results[n], all_stats[n] = (side, squares), stats
     return (results, all_stats) if return_stats else results
 
 
+def _run_one(job):
+    """Worker for pack_best_of (module level so it can be pickled)."""
+    n, kwargs = job
+    return pack_squares(n, return_stats=True, **kwargs)
+
+
+def pack_best_of(n, seeds=4, workers=None, time_limit=60.0, seed=0, **kwargs):
+    """
+    Run pack_squares for `seeds` different random seeds in parallel processes and keep the
+    smallest container.  With target=... the other runs are stopped as soon as one seed
+    reaches it (the time to find a best-known layout is random, so several seeds in parallel
+    are the most effective way to use several CPU cores).
+    Returns (side, squares, stats) where stats comes from the winning run and also lists
+    "seeds_run" and "side_per_seed".
+    """
+    import multiprocessing as mp
+    import os
+    workers = workers or min(seeds, os.cpu_count() or 1)
+    jobs = [(n, dict(kwargs, time_limit=time_limit, seed=seed + k)) for k in range(seeds)]
+    target = kwargs.get("target")
+    best, sides = None, []
+    if workers <= 1:
+        for job in jobs:
+            r = _run_one(job)
+            sides.append(r[0])
+            best = r if best is None or r[0] < best[0] else best
+            if target is not None and r[2]["reached_target"]:
+                break
+    else:
+        with mp.Pool(workers) as pool:
+            for r in pool.imap_unordered(_run_one, jobs):
+                sides.append(r[0])
+                best = r if best is None or r[0] < best[0] else best
+                if target is not None and r[2]["reached_target"]:
+                    pool.terminate()                         # a seed hit the target: stop the rest
+                    break
+    side, squares, stats = best
+    stats = dict(stats, seeds_run=len(sides), side_per_seed=sides)
+    return side, squares, stats
+
+
+def read_targets(path):
+    """
+    Read best-known side lengths from a CSV: a column `n` and one of
+    best_known / best_known_side / side / container_side / L / best (or simply the first two
+    columns, with or without a header).  Returns {n: side}.
+    """
+    import csv
+    with open(path, newline="") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return {}
+    header = [c.strip().lower() for c in rows[0]]
+    try:
+        float(rows[0][0])
+        has_header = False
+    except ValueError:
+        has_header = True
+    if not has_header:
+        return {int(float(r[0])): float(r[1]) for r in rows if len(r) >= 2}
+    ni = header.index("n") if "n" in header else 0
+    names = ("best_known", "best_known_side", "side", "container_side", "l", "best", "length")
+    vi = next((header.index(c) for c in names if c in header),
+              next(k for k in range(len(header)) if k != ni))
+    return {int(float(r[ni])): float(r[vi]) for r in rows[1:] if len(r) > max(ni, vi) and r[vi].strip()}
+
+
 def _fmt(v):
-    """Exact decimal expansion of a float (0.0 -> '0', 1.5 -> '1.5'); see strict_gaps.fmt."""
-    from decimal import Decimal
+    """Shortest text that reads back as exactly the same float (0.0 -> '0', 1.5 -> '1.5')."""
     v = float(v)
     if v == 0.0:
         return "0"
-    s = format(Decimal(v), "f")
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    return s if len(s) <= 90 else repr(v)
+    r = repr(v)
+    return r[:-2] if r.endswith(".0") else r
 
 
 def save_csv(results, filename="packings.csv", append=False, clockwise=False, start_id=None):
@@ -609,6 +768,13 @@ if __name__ == "__main__":
   python square_packing.py 11 60 --stall-limit 5 --max-hop 2 --hop-margin 0.6
                                                     tune the search
   python square_packing.py 5 30 --no-snap --no-plot keep raw angles, skip the PNG
+  python square_packing.py 11 200 --target 3.877084
+                                                    best-known side given: fixed-container
+                                                    search + stop when reached
+  python square_packing.py 11 200 --target 3.877084 --seeds 8 --workers 4
+                                                    8 seeds in parallel on 4 cores
+  python square_packing.py 1-30 60 --targets best_known.csv --csv out.csv
+                                                    targets for many n (CSV: n, best_known)
 
 When n is a range (e.g. 1-30) each result is reused as a building block for the
 larger n that follow (L-extension seeding), so list n in ascending order.
@@ -639,23 +805,53 @@ larger n that follow (L-extension seeding), so list n in ascending order.
                     help="a hop relocates 1..M squares (default 3)")
     ap.add_argument("--hop-margin", type=float, default=0.35, metavar="X",
                     help="extra container size given to a hop (default 0.35)")
+    ap.add_argument("--target", type=float, default=None, metavar="SIDE",
+                    help="best-known side length (single n): search a container of that size and "
+                         "stop when reached")
+    ap.add_argument("--targets", metavar="FILE",
+                    help="CSV of best-known side lengths (columns n and best_known/side/...) for "
+                         "several n")
+    ap.add_argument("--target-slack", type=float, default=None, metavar="X",
+                    help="room added to the target for the fixed-container search "
+                         "(default 0.13%% of the target)")
+    ap.add_argument("--target-fraction", type=float, default=0.8, metavar="F",
+                    help="share of the time spent on the fixed-container search (default 0.8)")
+    ap.add_argument("--seeds", type=int, default=1, metavar="K",
+                    help="run K random seeds (seed, seed+1, ...) and keep the best; with "
+                         "--workers they run in parallel (default 1)")
+    ap.add_argument("--workers", type=int, default=None, metavar="W",
+                    help="parallel processes for --seeds (default: number of CPU cores)")
     args = ap.parse_args()
 
     ns = _parse_ns(args.n)
+    targets = read_targets(args.targets) if args.targets else {}
+    if args.target is not None:
+        targets = {n: args.target for n in ns}
     angs = [float(a) for a in args.angles.split(",")] if args.angles else None
     results, total_attempts = {}, 0
     for n in ns:
-        side, squares, st = pack_squares(
-            n, time_limit=args.time, seed=args.seed, verbose=len(ns) == 1, angles=angs,
-            return_stats=True, snap=not args.no_snap, construct=not args.no_construct,
-            stall_limit=args.stall_limit, max_hop=args.max_hop, hop_margin=args.hop_margin,
-            bases=dict(results))
+        kw = dict(time_limit=args.time, seed=args.seed, angles=angs, snap=not args.no_snap,
+                  construct=not args.no_construct, stall_limit=args.stall_limit,
+                  max_hop=args.max_hop, hop_margin=args.hop_margin, bases=dict(results),
+                  target=targets.get(n), target_slack=args.target_slack,
+                  target_fraction=args.target_fraction)
+        if args.seeds > 1:
+            side, squares, st = pack_best_of(n, seeds=args.seeds, workers=args.workers, **kw)
+            print(f"  {st['seeds_run']} seed(s) run; sides: "
+                  + ", ".join(f"{v:.5f}" for v in st['side_per_seed']), flush=True)
+        else:
+            kw.pop("time_limit"); kw.pop("seed")
+            side, squares, st = pack_squares(n, time_limit=args.time, seed=args.seed,
+                                             verbose=len(ns) == 1, return_stats=True, **kw)
         results[n] = (side, squares)
         total_attempts += st["attempts"]
-        print(f"n = {n}: container side ~= {side:.5f}   "
+        tgt = ("" if targets.get(n) is None else
+               f"   target {targets[n]:.5f} {'REACHED' if st['reached_target'] else 'not reached'}")
+        print(f"n = {n}: container side ~= {side:.5f}{tgt}   "
               f"max violation {max_violation(side, squares):.1e}   "
               f"combinations attempted: {st['attempts']:,} "
-              f"({st['random_starts']:,} random + {st['seeded_starts']:,} seeded starts + {st['hops']:,} hops)", flush=True)
+              f"({st['random_starts']:,} random + {st['seeded_starts']:,} seeded starts + {st['hops']:,} hops"
+              f" + {st['fixed_container_attempts']:,} fixed-container)", flush=True)
         if args.csv:  # save progress after each n so long runs are never lost
             first = len(results) == 1   # --start-id applies to the first row only
             save_csv({n: results[n]}, args.csv, append=args.append or not first,
