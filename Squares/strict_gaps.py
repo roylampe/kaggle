@@ -20,7 +20,7 @@ from decimal import Decimal
 
 import numpy as np
 
-VERSION = "3.2"          # 3.x: same-angle squares exactly flush; 3.2: numbers written as exact decimals
+VERSION = "3.3"          # 3.x: same-angle squares flush; 3.3: survives a float round trip (text_safe)
 Q = 2.0 ** -40            # coordinate grid: multiples of Q are exactly representable
 ONE = 1 << 40             # 1.0 expressed in units of Q
 HALF_PI = math.pi / 2
@@ -209,6 +209,7 @@ def validate(cfg, gap=1e-6, flush_gap=1e-10):
     other = ~aligned
     ok = bool((pen[axis] <= 1e-12).all() and (pen[tilted] <= -0.5 * flush_gap).all()
               and (pen[other] <= -0.5 * gap).all())
+    ok = ok and uncertifiable_contacts(cfg) == 0
     info.update(ok=ok, flush_pairs=int((aligned & (pen > -1e-3)).sum()),
                 angled_pairs=int((other & (pen > -1e-3)).sum()))
     if other.any():
@@ -260,11 +261,91 @@ def finalize(cfg, gap=1e-6, flush_gap=1e-10, merge_deg=0.0, snap_tol=0.0, sweeps
     out = np.column_stack([x, y, t])
     if snap_tol > 0:
         out = tidy_gaps(out, tol=snap_tol, gap=gap, flush_gap=flush_gap)
-        x, y = out[:, 0], out[:, 1]
-        ok, info = validate(out, gap, flush_gap)
+    out = text_safe(out)
+    x, y = out[:, 0], out[:, 1]
+    ok, info = validate(out, gap, flush_gap)
     h = half_extent(t)
     side = float(max((x + h).max(), (y + h).max()))
     return out, side, info
+
+
+def repr_exact(v):
+    """True if the shortest text of float v (what pandas/to_csv writes) is EXACTLY v's value."""
+    v = float(v)
+    return Decimal(repr(v)) == Decimal(v)
+
+
+def text_safe(cfg, max_rounds=5000):
+    """
+    Make exact contact between axis-aligned squares survive being written as text.
+
+    An exact-decimal scorer can certify that two squares merely TOUCH only if the numbers
+    it reads are exactly representable in binary (0.5, 1.5, 2.25 ...).  Coordinates such as
+    2.2071082220427343 are not, and after a float -> text round trip (e.g. pandas
+    read_csv + to_csv) they stop being flush at all.  So:
+      * a flush contact between axis-aligned squares whose coordinates along the contact
+        are both exactly representable is left exactly flush;
+      * otherwise the later square is moved away by ONE grid step (2**-40 ~ 9e-13), the
+        smallest separation a scorer can certify.
+    Squares are only ever moved up/right, overlaps this creates are repaired, and angles are
+    untouched.  Returns a new cfg.
+    """
+    cfg = np.array(cfg, float)
+    n = len(cfg)
+    if n < 2:
+        return cfg
+    x, y, t = cfg[:, 0], cfg[:, 1], cfg[:, 2]
+    X = np.rint(x / Q).astype(np.int64)
+    Y = np.rint(y / Q).astype(np.int64)
+    on_grid = (X * Q == x) & (Y * Q == y) & (t == 0)       # exactly on the 2**-40 grid
+    iu, ju = near_pairs(x, y)
+    m = on_grid[iu] & on_grid[ju]
+    ia, ja = iu[m], ju[m]
+    if not len(ia):
+        return cfg
+    cache = {}
+
+    def ex(k):
+        k = int(k)
+        r = cache.get(k)
+        if r is None:
+            r = cache[k] = repr_exact(k * Q)
+        return r
+
+    for _ in range(max_rounds):
+        changed = False
+        for i, j in zip(ia, ja):
+            dx, dy = int(X[j] - X[i]), int(Y[j] - Y[i])
+            if abs(dx) == ONE and abs(dy) <= ONE and not (ex(X[i]) and ex(X[j])):
+                X[j if dx > 0 else i] += 1
+                changed = True
+            elif abs(dy) == ONE and abs(dx) < ONE and not (ex(Y[i]) and ex(Y[j])):
+                Y[j if dy > 0 else i] += 1
+                changed = True
+        if not changed:
+            break
+        _axis_repair(X, Y, ia, ja)                         # undo any overlap the nudge caused
+    out = cfg.copy()
+    out[on_grid, 0] = (X * Q)[on_grid]
+    out[on_grid, 1] = (Y * Q)[on_grid]
+    return out
+
+
+def uncertifiable_contacts(cfg):
+    """Number of flush axis-aligned contacts whose coordinates are not exactly representable."""
+    cfg = np.asarray(cfg, float)
+    x, y, t = cfg[:, 0], cfg[:, 1], cfg[:, 2]
+    iu, ju = near_pairs(x, y)
+    bad = 0
+    for i, j in zip(iu, ju):
+        if t[i] != 0 or t[j] != 0:
+            continue
+        dx, dy = abs(x[j] - x[i]), abs(y[j] - y[i])
+        if dx == 1.0 and dy <= 1.0 and not (repr_exact(x[i]) and repr_exact(x[j])):
+            bad += 1
+        elif dy == 1.0 and dx < 1.0 and not (repr_exact(y[i]) and repr_exact(y[j])):
+            bad += 1
+    return bad
 
 
 def tidy_gaps(cfg, tol=1e-3, gap=1e-6, flush_gap=1e-10, max_passes=30):
@@ -333,46 +414,42 @@ def tidy_gaps(cfg, tol=1e-3, gap=1e-6, flush_gap=1e-10, max_passes=30):
 
 
 def fmt(v):
-    """
-    Exact decimal expansion of a float (0.0 -> '0', 1.5 -> '1.5').
-
-    A scorer that reads the text as an exact decimal must see EXACTLY the number the packing
-    was built with.  The shortest round-trip text (repr) is a *different* decimal number, and
-    two squares that touch exactly would then overlap by ~1e-16 or be impossible to certify.
-    Coordinates are multiples of 2**-40, so their exact expansion has at most 40 decimals.
-    """
+    """Shortest text that reads back as exactly the same float (0.0 -> '0', 1.5 -> '1.5')."""
     v = float(v)
     if v == 0.0:
         return "0"
-    s = format(Decimal(v), "f")
-    if "." in s:
-        s = s.rstrip("0").rstrip(".")
-    return s if len(s) <= 90 else repr(v)
+    r = repr(v)
+    return r[:-2] if r.endswith(".0") else r
 
 
 def check_text_rows(rows_text):
     """
-    Check axis-aligned squares the way an exact-decimal scorer reads the file: parse the TEXT
-    of x, y as exact decimals.  Returns (overlapping_pairs, flush_pairs) among squares whose
-    angle text is '0'.  Flush pairs only certify when both numbers are exactly representable.
+    Check axis-aligned squares the way an exact-decimal scorer reads the file, INCLUDING a float
+    round trip (pandas read_csv + to_csv): the text of x, y is parsed to a float and re-printed.
+    Returns (overlapping_pairs, certifiable_flush_pairs, uncertifiable_flush_pairs); the first
+    and last must be 0.
     """
     pts = []
     for x, y, a in rows_text:
-        if Decimal(a) == 0:
-            pts.append((Decimal(x), Decimal(y)))
-    over = flush = 0
+        if float(a) == 0.0:
+            pts.append((Decimal(repr(float(x))), Decimal(repr(float(y))),
+                        repr_exact(float(x)), repr_exact(float(y))))
+    over = flush_ok = flush_bad = 0
     ONE_D = Decimal(1)
     for i in range(len(pts)):
-        xi, yi = pts[i]
+        xi, yi, exi, eyi = pts[i]
         for j in range(i + 1, len(pts)):
-            dx, dy = abs(pts[j][0] - xi), abs(pts[j][1] - yi)
+            xj, yj, exj, eyj = pts[j]
+            dx, dy = abs(xj - xi), abs(yj - yi)
             if dx >= 2 or dy >= 2:
                 continue
             if dx < ONE_D and dy < ONE_D:
                 over += 1
-            elif dx == ONE_D or dy == ONE_D:
-                flush += 1
-    return over, flush
+            elif dx == ONE_D and dy <= ONE_D:
+                flush_ok, flush_bad = (flush_ok + 1, flush_bad) if (exi and exj) else (flush_ok, flush_bad + 1)
+            elif dy == ONE_D and dx < ONE_D:
+                flush_ok, flush_bad = (flush_ok + 1, flush_bad) if (eyi and eyj) else (flush_ok, flush_bad + 1)
+    return over, flush_ok, flush_bad
 
 
 def check_rows(rows, gap_tol=1e-9):

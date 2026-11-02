@@ -77,7 +77,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from strict_gaps import VERSION as STRICT_VERSION      # noqa: E402
 from strict_gaps import check_rows, check_text_rows, finalize, fmt      # noqa: E402
 
-VERSION = "3.2"      # 3.x: same-angle squares exactly flush; 3.2: numbers written as exact decimals
+VERSION = "3.3"      # 3.x: same-angle squares flush; 3.3: survives a float round trip (text_safe)
 
 
 # ----------------------------------------------------------------------------
@@ -605,9 +605,9 @@ def main():
     print(f"overlap as measured: {raw['worst']:+.2e}  (positive = overlap, negative = gap)")
     print(f"verified from file : max overlap depth {chk['worst']:+.2e}  -> {status};  "
           f"bounding square side {chk['side']:.6f}")
-    over, exact_flush = check_text_rows(read_back_text(out, len(cfg)))
-    print(f"exact-decimal check: axis-aligned pairs overlapping {over}, exactly flush {exact_flush}"
-          + ("" if over == 0 else "   <-- PROBLEM"))
+    over, flush_ok, flush_bad = check_text_rows(read_back_text(out, len(cfg)))
+    print(f"scorer-style check : axis-aligned pairs overlapping {over}; exactly flush & certifiable "
+          f"{flush_ok}; flush but NOT certifiable {flush_bad}" + ("" if over == 0 and flush_bad == 0 else "   <-- PROBLEM"))
     print(f"contacts           : {chk['flush']} flush (same angle, no gap);  "
           f"smallest gap between different angles: {chk['min_angled_gap']:.2e}")
     print(f"CSV written       : {out}   (ids {first}..{last})")

@@ -31,7 +31,7 @@ EPS = 1e-12
 GAP = 1e-6          # gap between squares with DIFFERENT angles; same-angle squares are flush
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from strict_gaps import Q, finalize, fmt, half_extent, tidy_gaps, validate      # noqa: E402
+from strict_gaps import Q, finalize, fmt, half_extent, text_safe, tidy_gaps, validate      # noqa: E402
 
 
 # ---------------------------------------------------------------- base shapes
@@ -130,6 +130,7 @@ def proven_optimal(n):
 def main():
     side, how, seeds = plan()
     memo = {}
+    final_side = {}
     rows = 0
     with open(os.path.join(HERE, "packings.csv"), "w", newline="") as f, \
          open(os.path.join(HERE, "packings_summary.csv"), "w", newline="") as g:
@@ -137,14 +138,16 @@ def main():
         w.writerow(["id", "n", "square_id", "x", "y", "angle"])
         ws.writerow(["n", "container_side", "method", "proven_optimal_size"])
         for n in range(1, N_MAX + 1):
-            cfg = tidy_gaps(build(n, how, seeds, side, memo), tol=1e-3, gap=GAP)
+            cfg = text_safe(tidy_gaps(build(n, how, seeds, side, memo), tol=1e-3, gap=GAP))
             assert len(cfg) == n, (n, len(cfg))
+            hh = half_extent(cfg[:, 2])      # text_safe may nudge squares by ~1e-12: recompute the side
+            final_side[n] = max(side[n], float((cfg[:, 0] + hh).max()), float((cfg[:, 1] + hh).max()))
             for sid, (x, y, a) in enumerate(cfg):
                 w.writerow([rows, n, sid, fmt(x), fmt(y), fmt(a)])
                 rows += 1
             kind, arg = how[n]
             m = kind if arg is None else f"{kind} (from n={arg})"
-            ws.writerow([n, f"{side[n]:.9f}", m, proven_optimal(n)])
+            ws.writerow([n, f"{final_side[n]:.9f}", m, proven_optimal(n)])
     print("rows written:", rows)
 
     # ---- verify by reading the CSV back from disk
@@ -157,7 +160,7 @@ def main():
     for n in range(1, N_MAX + 1):
         sq = sorted(data[n])
         assert [s[0] for s in sq] == list(range(n))
-        wall, ok = check(np.array([s[1:] for s in sq]), side[n])
+        wall, ok = check(np.array([s[1:] for s in sq]), final_side[n])
         if wall > EPS or not ok:
             bad += 1
             print("INVALID", n, wall, ok)
